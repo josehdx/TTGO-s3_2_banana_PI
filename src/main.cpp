@@ -1,4 +1,4 @@
-// v1.13 Banana Leaf Headless Controller (Decoupled Engine & Diagnostics Edition)
+// v1.14 Banana Leaf Headless Controller (Delta Updates & Persistent Prefs Edition)
 #pragma GCC optimize ("O3")
 #include <Arduino.h>
 #include <Control_Surface.h>
@@ -137,6 +137,28 @@ const unsigned long SCREEN_OFF_TIMEOUT = 86400000;
 const unsigned long LIGHT_SLEEP_TIMEOUT = 172800000; 
 unsigned long lastActivityTime=0;
 
+std::atomic<float> ui_audio_level __attribute__((aligned(64))) {0.0f};
+std::atomic<float> ui_output_level __attribute__((aligned(64))) {0.0f};
+
+volatile bool isAdcPaused=false;
+adc_continuous_handle_t multifx_adc_handle = NULL;
+volatile int latestPB1=2048, latestPB2=2048, latestPB3=2048;
+std::atomic<int> latestBat{2048};
+std::atomic<int> currentBatteryPercent{100};
+volatile float currentBatteryVoltage=4.00f;
+std::atomic<bool> isBatteryCharging{false};
+const int BATTERY_PIN=4, BOOT_SENSE_PIN=0, BLE_TOGGLE_PIN=14, SYSTEM_POWER_LATCH_PIN=5;
+
+pin_t pinPB=1, pinPB2=2, pinPB3=10, pinPar1=3, pinPar2=11, pinPar3=12, pinPar4=13, pinPar5=16;
+uint16_t lastMidiSent=8192;
+volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0; 
+
+FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar1=pinPar1, filterPar2=pinPar2, filterPar3=pinPar3, filterPar4=pinPar4, filterPar5=pinPar5;
+BluetoothMIDI_Interface btmidi;
+USBMIDI_Interface usbmidi;
+MIDI_PipeFactory<4> pipes;
+PedalManager pedals;
+
 void cycleLatencyMode() {
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
@@ -219,28 +241,6 @@ float fbHpfState=0.0f, feedbackFilter=0.0f;
 std::atomic<int> hardwareSyncMuteFrames{0}; 
 volatile bool sampleRateToggleRequested=false, pb2ToggleRequested=false;
 
-std::atomic<float> ui_audio_level __attribute__((aligned(64))) {0.0f};
-std::atomic<float> ui_output_level __attribute__((aligned(64))) {0.0f};
-
-volatile bool isAdcPaused=false;
-adc_continuous_handle_t multifx_adc_handle = NULL;
-volatile int latestPB1=2048, latestPB2=2048, latestPB3=2048;
-std::atomic<int> latestBat{2048};
-std::atomic<int> currentBatteryPercent{100};
-volatile float currentBatteryVoltage=4.00f;
-std::atomic<bool> isBatteryCharging{false};
-const int BATTERY_PIN=4, BOOT_SENSE_PIN=0, BLE_TOGGLE_PIN=14, SYSTEM_POWER_LATCH_PIN=5;
-
-pin_t pinPB=1, pinPB2=2, pinPB3=10, pinPar1=3, pinPar2=11, pinPar3=12, pinPar4=13, pinPar5=16;
-uint16_t lastMidiSent=8192;
-volatile uint16_t currentPB1=8192, currentPB2=8192, currentPB3=8192, currentCC11=0; 
-
-FilteredAnalog<12, 4, uint32_t, uint32_t> filterPar1=pinPar1, filterPar2=pinPar2, filterPar3=pinPar3, filterPar4=pinPar4, filterPar5=pinPar5;
-BluetoothMIDI_Interface btmidi;
-USBMIDI_Interface usbmidi;
-MIDI_PipeFactory<4> pipes;
-PedalManager pedals;
-
 void fetchADCDMA() {
     if(isAdcPaused) return;
     uint8_t result[128] __attribute__((aligned(4)));
@@ -294,6 +294,18 @@ void switchEffectMode(int newMode) {
     lastParameterChangeTime = millis();
 }
 
+// DELTA UPDATE GLOBALS FOR NVS FLASHING
+static int lastSavedMode = -1;
+static int lastSavedLatMode = -1;
+static int lastSavedFbIdx = -1;
+static bool lastSavedPb2Wiper = false; 
+static bool lastSavedVolMode = false;
+static uint16_t lastSavedFxStates = 0xFFFF;
+static uint32_t lastSavedSampleRate = 0;
+static AppSettings lastSavedDspData;
+static bool firstSave = true;
+
+// DELTA UPDATES & NO PREFERENCES CLOSE: Massive Latency Spike Mitigation
 void saveSettings() {
     DSPCoreState* activeDSP = dspActiveState.load(std::memory_order_acquire);
     AppSettings cs;
@@ -317,16 +329,50 @@ void saveSettings() {
     bool pb2Copy = isPB2WiperMode, volCopy = isVolumeMode; 
     uint32_t srCopy = currentSampleRate.load(std::memory_order_acquire);
     
-    preferences.begin("whammy_cfg", false); 
-    preferences.putInt("activeMode", modeCopy); 
-    preferences.putInt("latMode", latCopy); 
-    preferences.putBool("pb2Wiper", pb2Copy); 
-    preferences.putBool("volMode", volCopy); 
-    preferences.putUShort("fxStates", fxStates); 
-    preferences.putUInt("sampleRate", srCopy); 
-    preferences.putInt("fbIdx", fbCopy); 
-    preferences.putBytes("dspData", &cs, sizeof(AppSettings)); 
-    preferences.end();
+    // DELTA CHECKS: Only send flash commands if the actual value has changed
+    if (firstSave || modeCopy != lastSavedMode) {
+        preferences.putInt("activeMode", modeCopy);
+        lastSavedMode = modeCopy;
+    }
+    if (firstSave || latCopy != lastSavedLatMode) {
+        preferences.putInt("latMode", latCopy);
+        lastSavedLatMode = latCopy;
+    }
+    if (firstSave || pb2Copy != lastSavedPb2Wiper) {
+        preferences.putBool("pb2Wiper", pb2Copy);
+        lastSavedPb2Wiper = pb2Copy;
+    }
+    if (firstSave || volCopy != lastSavedVolMode) {
+        preferences.putBool("volMode", volCopy);
+        lastSavedVolMode = volCopy;
+    }
+    if (firstSave || fxStates != lastSavedFxStates) {
+        preferences.putUShort("fxStates", fxStates);
+        lastSavedFxStates = fxStates;
+    }
+    if (firstSave || srCopy != lastSavedSampleRate) {
+        preferences.putUInt("sampleRate", srCopy);
+        lastSavedSampleRate = srCopy;
+    }
+    if (firstSave || fbCopy != lastSavedFbIdx) {
+        preferences.putInt("fbIdx", fbCopy);
+        lastSavedFbIdx = fbCopy;
+    }
+    
+    // Check if block data actually changed
+    bool dspDataChanged = firstSave;
+    if (!dspDataChanged) {
+        if (memcmp(&cs, &lastSavedDspData, sizeof(AppSettings)) != 0) {
+            dspDataChanged = true;
+        }
+    }
+    if (dspDataChanged) {
+        preferences.putBytes("dspData", &cs, sizeof(AppSettings));
+        memcpy(&lastSavedDspData, &cs, sizeof(AppSettings));
+    }
+
+    firstSave = false;
+    // preferences.end() has been explicitly REMOVED to keep FS open
 }
 
 int getBatteryPercentage(float voltage) {
@@ -845,7 +891,7 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 float peakInputVal=0.0f, peakOutputVal=0.0f, localSwellGain=swellGain, localVolGain=c_vg, localFrzRamp=freezeRamp, localFbRamp=feedbackRamp, pdSmCoeff=powf(p_pd_sm, srScale), target_delay=constrain((float)(currentSampleRate.load(std::memory_order_acquire)*p_fb_off), 0.0f, (float)(FB_BUFFER_SIZE-1)); smoothed_delay_samples+= (target_delay-smoothed_delay_samples)*0.01f*srScale+DC_OFFSET; int delaySamples=(int)smoothed_delay_samples; float fbHpfCoeff=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.025f:0.05f, fbLpfCoeff=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.05f:0.1f, fbLpfRetain=1.0f-fbLpfCoeff, dc_alpha=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.0005f:0.001f; int halfWindow=(int)currentWindowSize/2; bool activeGroup=c_w||harmActive||chorusActive||feedbackActive||synthActive||padActive||frzActive||vibratoActive||capoActive, dryGroup=chorusActive||padActive||frzActive||feedbackActive||(localFrzRamp>0.0f)||(localFbRamp>0.0f), repeatGroup=capoActive||synthActive||vibratoActive||padActive||harmActive;
                 float g_base=0.0f; if(dryGroup) { if(!repeatGroup) g_base=0.4f; } else if(harmActive) g_base=0.5f; else g_base=1.0f; float g_w2=harmActive?p_hr_mix:0.0f, g_w3=chorusActive?p_ch_mix:0.0f; bool padIsAudible=padActive||(fabsf(padFilter)>0.001f); float g_pad=padIsAudible?p_pd_mix:0.0f, g_frz=(!frzActive&&localFrzRamp>0.0f)?0.5f:0.0f, g_fb=(feedbackActive||localFbRamp>0.0f)?0.6f:0.0f, g_whammy=c_w?p_w_wet:0.0f, g_dry=c_w?p_w_dry:1.0f, vol_alpha=0.01f*srScale, meter_decay=(currentSampleRate.load(std::memory_order_acquire)==96000)?0.999f:0.998f, envRetain=powf(0.99f,srScale), envAttack=1.0f-envRetain;
                 
-                // HARDENED DSP SANITIZATION
+                // HARDENED DSP SANITIZATION: Validate both synth state variables to prevent NaN pollution
                 if(__builtin_expect(isnan(synthFilter)||isinf(synthFilter), 0)) synthFilter=0.0f; 
                 if(__builtin_expect(isnan(synthBandpass)||isinf(synthBandpass), 0)) synthBandpass=0.0f;
                 if(__builtin_expect(isnan(padFilter)||isinf(padFilter), 0)) padFilter=0.0f; 
@@ -858,7 +904,7 @@ void IRAM_ATTR __attribute__((optimize("O3"))) AudioDSPTask(void * pvParameters)
                 int nextDryIdx = (currentDryIdx + HOP_SIZE) & BUFFER_MASK;
                 
                 dma_transfer_done.store(false, std::memory_order_release);
-                // BOUNDARY CHECK
+                // BOUNDARY CHECK: Guard esp_cache_msync against out-of-bounds PSRAM scanning
                 if (__builtin_expect(MAX_BUFFER_SIZE - nextDryIdx >= HOP_SIZE, 1)) {
                     esp_cache_msync((void*)&delayBuffer[nextDryIdx], HOP_SIZE * sizeof(int16_t), ESP_CACHE_MSYNC_FLAG_DIR_C2M);
                     if (esp_async_memcpy(dma_memcpy_handle, activeDmaWriteBuf, &delayBuffer[nextDryIdx], HOP_SIZE * sizeof(int16_t), dma_memcpy_cb, (void*)&dma_transfer_done) != ESP_OK) {
@@ -1140,6 +1186,7 @@ void updateParameterFromCC(uint8_t cc, uint8_t val) {
 }
 
 bool channelMessageCallback(ChannelMessage cm) {
+    lastActivityTime=millis();
     if(cm.header==0xB0) {
         if(cm.data1==3 && cm.data2>=64) {
             sampleRateToggleRequested = true;
@@ -1246,7 +1293,9 @@ void setup() {
     dig_cfg.pattern_num=4; dig_cfg.adc_pattern=adc_pattern;
     ESP_ERROR_CHECK(adc_continuous_config(multifx_adc_handle, &dig_cfg)); ESP_ERROR_CHECK(adc_continuous_start(multifx_adc_handle));
     
-    preferences.begin("whammy_cfg", true); 
+    // PERSISTENT NVS READ-WRITE MODE: File system stays strictly open.
+    preferences.begin("whammy_cfg", false); 
+    
     activeEffectMode.store(constrain(preferences.getInt("activeMode", 0), 0, 9), std::memory_order_release);
     latencyMode.store(constrain(preferences.getInt("latMode", 0), 0, 3), std::memory_order_release); 
     isPB2WiperMode=preferences.getBool("pb2Wiper", false); isVolumeMode=false; 
@@ -1257,11 +1306,11 @@ void setup() {
         for(int i=0; i<10; i++) { effectMemory[i]=savedSettings.fxMem[i]; for(int p=0; p<5; p++) fxParams[i][p]=savedSettings.params[i][p]; }
     }
     
-    isWhammyActive = true; 
-    isFrozen=false; isFeedbackActive=false; isHarmonizerMode=false; isCapoMode=false; 
-    isSynthMode=false; isPadMode=false; isChorusMode=false; isSwellMode=false; isVibratoMode=false;
-    preferences.end();
+    uint16_t fxStates=preferences.getUShort("fxStates", 1);
+    isWhammyActive=(fxStates&(1<<0)); isFrozen=(fxStates&(1<<1)); isFeedbackActive=(fxStates&(1<<2)); isHarmonizerMode=(fxStates&(1<<3)); isCapoMode=(fxStates&(1<<4)); isSynthMode=(fxStates&(1<<5)); isPadMode=(fxStates&(1<<6)); isChorusMode=(fxStates&(1<<7)); isSwellMode=(fxStates&(1<<8)); isVibratoMode=(fxStates&(1<<9));
     
+    // REMOVED preferences.end(); to keep access continuous and fast!
+
     commitDSPState();
     
     pinMode(BATTERY_PIN, INPUT); pinMode(38, OUTPUT); digitalWrite(38, LOW); pinMode(15, OUTPUT); digitalWrite(15, HIGH);
@@ -1275,7 +1324,7 @@ void setup() {
     
     sramPitchBuffer=(int16_t*)heap_caps_aligned_alloc(64, SRAM_PITCH_BUF_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
-    // HARD-LOCKED TO ZERO-WAIT-STATE INTERNAL SRAM
+    // HARD-LOCKED TO ZERO-WAIT-STATE INTERNAL SRAM (NO PSRAM FALLBACK)
     fbDelayBuffer=(int16_t*)heap_caps_aligned_alloc(64, FB_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
     freezeBuffer=(int16_t*)heap_caps_aligned_alloc(64, FREEZE_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM);
