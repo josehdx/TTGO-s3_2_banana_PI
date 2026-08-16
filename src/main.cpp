@@ -1,11 +1,7 @@
-// v1.42 Banana Leaf Headless Benchmark (HCI CONTROLLER & NATIVE NIMBLE FIX)
+// v1.43 Banana Leaf Headless Benchmark (BLE DECOUPLED & +9dBm TX POWER)
 #include <Arduino.h>
 
 #include <Control_Surface.h>
-#include <esp_nimble_hci.h> // Raw ESP-IDF Controller hardware init
-#include <esp_bt.h>
-#include <esp_mac.h>
-
 #include <driver/i2s_std.h>
 #include "driver/gpio.h"
 #include "soc/gpio_reg.h"
@@ -17,7 +13,6 @@
 #include "esp_private/brownout.h"
 #include "esp_pm.h"
 #include "esp_task_wdt.h" 
-#include "PedalManager.h"
 #include "esp_async_memcpy.h"
 #include "esp_cache.h"
 
@@ -25,6 +20,8 @@
 #include "SettingsManager.h"
 #include "DSPEngine.h"
 #include "MidiRouter.h"
+#include "PedalManager.h"
+#include "BluetoothManager.h" // Encapsulated BLE Hardware Config
 
 // --- BANANA-SPECIFIC COMPONENTS ---
 #include "BananaHardware.h"
@@ -32,7 +29,7 @@
 #include "StressTester.h"
 
 #define ENABLE_ADVANCED_TELEMETRY 
-#define ENABLE_STRESS_TESTER false 
+#define ENABLE_STRESS_TESTER true 
 
 #ifdef ENABLE_ADVANCED_TELEMETRY
     std::atomic<uint32_t> audio_underflow_count{0};
@@ -460,13 +457,7 @@ void setup() {
     ESP_ERROR_CHECK(err);
 
     // 1. MANUALLY PRE-INITIALIZE THE RAW ESP-IDF HCI CONTROLLER 
-    // This is required in Core 3.0 because Control Surface's BLE wrapper 
-    // forgets to do this before initializing the host port.
-    Serial.println("[BLE] Pre-initializing NimBLE HCI Controller...");
-    esp_err_t err_hci = esp_nimble_hci_init();
-    if (err_hci != ESP_OK) {
-        Serial.printf("[BLE] HCI Init Failed! Error: %d\n", err_hci);
-    }
+    BluetoothManager::initHCI();
 
     // 2. ESTABLISH STATIC MIDI ROUTING PIPES
     Serial.println("[MIDI] Establishing MIDI pipe routing...");
@@ -483,14 +474,7 @@ void setup() {
     Control_Surface.begin();
 
     // 4. CONFIGURE BLE EXTRAS USING RAW ESP-IDF APIs
-    Serial.println("[BLE] Setting TX Power to Default (+3dBm)...");
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P3);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P3);
-    
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_BT);
-    Serial.printf("[BLE] NimBLE baseband up! Hardware MAC: %02x:%02x:%02x:%02x:%02x:%02x\n", 
-                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    BluetoothManager::configurePowerAndMac();
 
     #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
         esp_task_wdt_config_t wdt_cfg = {
@@ -619,9 +603,11 @@ void loop() {
             if (pressDuration >= 1000) { 
                 if (bleEnabled.load(std::memory_order_relaxed)) { 
                     Serial.println("[BLE] MANUAL TOGGLE TRIPPED: STOPPING BLUETOOTH");
+                    //btStop(); 
                     bleEnabled.store(false, std::memory_order_relaxed); 
                 } else { 
                     Serial.println("[BLE] MANUAL TOGGLE TRIPPED: STARTING BLUETOOTH");
+                    //btStart(); 
                     bleEnabled.store(true, std::memory_order_relaxed); 
                 } 
             } else if (pressDuration >= 50) { cycleLatencyMode(); }
