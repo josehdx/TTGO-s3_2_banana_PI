@@ -1,4 +1,4 @@
-// v1.43 Banana Leaf Headless Benchmark (BLE DECOUPLED & +9dBm TX POWER)
+// v1.45 Banana Leaf Headless Benchmark (Source 21 IDF BLE + I2S Thread Safety Fix)
 #include <Arduino.h>
 
 #include <Control_Surface.h>
@@ -21,7 +21,7 @@
 #include "DSPEngine.h"
 #include "MidiRouter.h"
 #include "PedalManager.h"
-#include "BluetoothManager.h" // Encapsulated BLE Hardware Config
+#include "BluetoothManager.h" 
 
 // --- BANANA-SPECIFIC COMPONENTS ---
 #include "BananaHardware.h"
@@ -204,11 +204,17 @@ void cycleLatencyMode() {
 }
 
 void toggleSampleRate() {
-    i2s_channel_disable((i2s_chan_handle_t)tx_chan); i2s_channel_disable((i2s_chan_handle_t)rx_chan); 
+    // 1. Tell DSP task to park FIRST to avoid i2s_channel_write errors
     dsp_is_paused.store(true, std::memory_order_release);
     while(!dsp_ack_parked.load(std::memory_order_acquire)) { vTaskDelay(pdMS_TO_TICKS(1)); }
 
-    i2s_del_channel((i2s_chan_handle_t)tx_chan); i2s_del_channel((i2s_chan_handle_t)rx_chan);
+    // 2. Safely disable and delete channels after DSP task is parked
+    i2s_channel_disable((i2s_chan_handle_t)tx_chan); 
+    i2s_channel_disable((i2s_chan_handle_t)rx_chan); 
+
+    i2s_del_channel((i2s_chan_handle_t)tx_chan); 
+    i2s_del_channel((i2s_chan_handle_t)rx_chan);
+
     uint32_t newSr = (currentSampleRate.load(std::memory_order_acquire) == 96000) ? 48000 : 96000;
     currentSampleRate.store(newSr, std::memory_order_release); settingsNeedSaving = false; lutNeedsUpdate = true;
 
@@ -456,7 +462,7 @@ void setup() {
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) { ESP_ERROR_CHECK(nvs_flash_erase()); err = nvs_flash_init(); }
     ESP_ERROR_CHECK(err);
 
-    // 1. MANUALLY PRE-INITIALIZE THE RAW ESP-IDF HCI CONTROLLER 
+    // 1. MANUALLY PRE-INITIALIZE THE RAW ESP-IDF CONTROLLER & HCI
     BluetoothManager::initHCI();
 
     // 2. ESTABLISH STATIC MIDI ROUTING PIPES
@@ -469,11 +475,10 @@ void setup() {
     Control_Surface.setMIDIInputCallbacks(channelMessageCallback, nullptr, nullptr, nullptr); 
 
     // 3. START CONTROL SURFACE 
-    // This safely hooks into the pre-initialized HCI and boots the MIDI interfaces.
     Serial.println("[MIDI] Initializing Control Surface...");
     Control_Surface.begin();
 
-    // 4. CONFIGURE BLE EXTRAS USING RAW ESP-IDF APIs
+    // 4. CONFIGURE MAXIMUM TX POWER (+9dBm) AND READ MAC
     BluetoothManager::configurePowerAndMac();
 
     #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
@@ -709,7 +714,8 @@ void loop() {
     tData.peakLoopLatency = max_loop_latency_ms.exchange(0, std::memory_order_relaxed);
 
     static unsigned long lastTelemetryPrint = 0;
-    if (millis() - lastTelemetryPrint >= 10000) {
+    // Changed from 10000 to 7000 to alias across 5s toggle states
+    if (millis() - lastTelemetryPrint >= 7000) {
         lastTelemetryPrint = millis();
         serialMonitor.printMetrics(tData);
         Serial.printf("\n[DIAGNOSTICS] BLE MIDI Active & Running.\n");

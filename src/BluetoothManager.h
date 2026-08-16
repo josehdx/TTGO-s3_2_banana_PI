@@ -8,18 +8,35 @@
 
 class BluetoothManager {
 public:
-    // 1. Manually pre-initialize the HCI controller before the Control Surface boots
+    // Manually initialize the hardware controller and HCI layer
     static void initHCI() {
-        Serial.println("[BLE] Pre-initializing NimBLE HCI Controller...");
+        Serial.println("[BLE] Pre-initializing BT Controller & HCI...");
+
+        // 1. Initialize BT Controller Configuration
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        esp_err_t ret = esp_bt_controller_init(&bt_cfg);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            Serial.printf("[BLE] BT Controller Init Failed! Error: %d\n", ret);
+            return;
+        }
+
+        // 2. Enable BT Controller in BLE Mode
+        ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            Serial.printf("[BLE] BT Controller Enable Failed! Error: %d\n", ret);
+            return;
+        }
+
+        // 3. Initialize NimBLE HCI Interface
         esp_err_t err_hci = esp_nimble_hci_init();
-        if (err_hci != ESP_OK) {
+        if (err_hci != ESP_OK && err_hci != ESP_ERR_INVALID_STATE) {
             Serial.printf("[BLE] HCI Init Failed! Error: %d\n", err_hci);
         } else {
             Serial.println("[BLE] HCI Controller Successfully Initialized.");
         }
     }
 
-    // 2. Configure maximum transmission power (+9dBm) after baseband is up
+    // Configure maximum transmission power (+9dBm) after baseband is up
     static void configurePowerAndMac() {
         Serial.println("[BLE] Setting TX Power to Maximum (+9dBm)...");
         
