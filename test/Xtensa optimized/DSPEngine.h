@@ -57,16 +57,10 @@ public:
         return __builtin_fmaf(v2 - v1, frac, v1);
     }
 
-    // --- ZERO-LATENCY PRE-CALCULATED SINC LUT INTERPOLATOR ---
-    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("Ofast"))) processPitchTap(
-        uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, 
-        uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT, const float* pitchSincLUT) {
-        
+    // --- 4-POINT FPU-OPTIMIZED HERMITE INTERPOLATOR (Zero Trig/Division) ---
+    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("Ofast"))) processSincTap(uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT) {
         int T = (tapPhase >> 16) & windowMask; 
-        uint32_t fracInt = tapPhase & 0xFFFF;
-        
-        // Bit-shift 0-65535 map instantly down to 0-1023 (LUT Resolution Index)
-        int lutIdxFrac = fracInt >> 6; 
+        float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
         
         int startIdx = (currentSramWriteIdx - T - 2 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
         float y_m1, y0, y1, y2;
@@ -83,16 +77,42 @@ public:
             y_m1 = (float)sramBuffer[(startIdx + 3) & SRAM_PITCH_BUF_MASK] * 3.0517578125e-5f;
         }
 
-        // Fetch pre-calculated 4-point Sinc Window coefficients mapped to this fractional phase
-        int baseLut = lutIdxFrac << 2; // Equivalent to lutIdxFrac * 4
-        float w_m1 = pitchSincLUT[baseLut];
-        float w_0  = pitchSincLUT[baseLut + 1];
-        float w_1  = pitchSincLUT[baseLut + 2];
-        float w_2  = pitchSincLUT[baseLut + 3];
-
-        // Hardware Fused Multiply-Add crossfade
-        float interpSample = __builtin_fmaf(y_m1, w_m1, __builtin_fmaf(y0, w_0, __builtin_fmaf(y1, w_1, y2 * w_2)));
+        float c0 = y0; 
+        float c1 = 0.5f * (y1 - y_m1);
+        float c2 = y_m1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;
+        float c3 = 0.5f * (y2 - y_m1) + 1.5f * (y0 - y1);
         
+        float interpSample = ((c3 * frac + c2) * frac + c1) * frac + c0;
+        int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 4095; 
+        return AntiDenormal(interpSample * hannLUT[lutIdx]);
+    }
+
+    // --- 4-POINT FPU-OPTIMIZED HERMITE INTERPOLATOR ---
+    static inline float __attribute__((hot)) __attribute__((always_inline)) __attribute__((optimize("Ofast"))) processHermiteTap(uint32_t tapPhase, const int16_t* sramBuffer, int currentSramWriteIdx, uint32_t windowMask, uint32_t hannIntMult, const float* hannLUT) {
+        int T = (tapPhase >> 16) & windowMask; 
+        float frac = (tapPhase & 0xFFFF) * 0.0000152587890625f; 
+        
+        int startIdx = (currentSramWriteIdx - T - 2 + SRAM_PITCH_BUF_SIZE) & SRAM_PITCH_BUF_MASK;
+        float y_m1, y0, y1, y2;
+
+        if (__builtin_expect(startIdx <= SRAM_PITCH_BUF_MASK - 3, 1)) {
+            y2   = (float)sramBuffer[startIdx]     * 3.0517578125e-5f;
+            y1   = (float)sramBuffer[startIdx + 1] * 3.0517578125e-5f;
+            y0   = (float)sramBuffer[startIdx + 2] * 3.0517578125e-5f;
+            y_m1 = (float)sramBuffer[startIdx + 3] * 3.0517578125e-5f;
+        } else {
+            y2   = (float)sramBuffer[(startIdx + 0) & SRAM_PITCH_BUF_MASK] * 3.0517578125e-5f;
+            y1   = (float)sramBuffer[(startIdx + 1) & SRAM_PITCH_BUF_MASK] * 3.0517578125e-5f;
+            y0   = (float)sramBuffer[(startIdx + 2) & SRAM_PITCH_BUF_MASK] * 3.0517578125e-5f;
+            y_m1 = (float)sramBuffer[(startIdx + 3) & SRAM_PITCH_BUF_MASK] * 3.0517578125e-5f;
+        }
+
+        float c0 = y0; 
+        float c1 = 0.5f * (y1 - y_m1);
+        float c2 = y_m1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;
+        float c3 = 0.5f * (y2 - y_m1) + 1.5f * (y0 - y1);
+        
+        float interpSample = ((c3 * frac + c2) * frac + c1) * frac + c0;
         int lutIdx = ((uint32_t)(T * hannIntMult) >> 16) & 4095; 
         return AntiDenormal(interpSample * hannLUT[lutIdx]);
     }

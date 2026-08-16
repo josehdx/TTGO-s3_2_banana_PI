@@ -1,4 +1,4 @@
-// v1.49 Banana Leaf Headless Benchmark (Sinc LUT Interpolator Core)
+// v1.48 Banana Leaf Headless Benchmark (Full SIMD PIE Interpolator Core)
 #include <Arduino.h>
 
 #include <Control_Surface.h>
@@ -116,7 +116,6 @@ int writeIndex = 0, fbDelayWriteIdx = 0, sramWriteIdx = 0;
 float *hannLUT = nullptr;
 float *lfoLUT = nullptr;
 float *synthLUT = nullptr;
-float *pitchSincLUT = nullptr;
 
 float *apf1Buffer = nullptr;
 float *apf2Buffer = nullptr;
@@ -292,8 +291,8 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
     float c_fx[10][5] = {0.0f}; int c_lat=0, c_act=0; bool c_w=true, c_fz=false, c_fb=false, c_hr=false, c_cp=false, c_sy=false, c_pd=false, c_ch=false, c_sw=false, c_vb=false; float c_vg=1.0f;
     const float normFactor=1.0f/2147483648.0f, DC_OFFSET=1e-9f;
     
-    // Safety check - do not process audio until ALL dynamic LUTs are allocated
-    while (hannLUT == nullptr || lfoLUT == nullptr || synthLUT == nullptr || apf1Buffer == nullptr || apf2Buffer == nullptr || pitchSincLUT == nullptr) { vTaskDelay(pdMS_TO_TICKS(10)); }
+    // Safety check - do not process audio until dynamic LUTs are allocated
+    while (hannLUT == nullptr || lfoLUT == nullptr || synthLUT == nullptr || apf1Buffer == nullptr || apf2Buffer == nullptr) { vTaskDelay(pdMS_TO_TICKS(10)); }
     
     for(;;) {
         if(__builtin_expect(dsp_is_paused.load(std::memory_order_acquire), 0)) {
@@ -406,8 +405,8 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                     if(__builtin_expect(feedbackActive||localFbRamp>0.0f, 0)) {
                         localFbPhase+=feedbackPhaseIncr; if(localFbPhase>=LFO_LUT_SIZE) localFbPhase-=LFO_LUT_SIZE; float lfoVal=DSPEngine::getLfoInterpolated(localFbPhase, lfoLUT); spd4=lfoVal; spd5=currentPitch*globalFbRatio.load(std::memory_order_relaxed)*lfoVal;
                         wowRng = wowRng * 1664525U + 1013904223U; float rawNoise = ((float)(wowRng & 0xFFFF) * 0.0000305185f) - 1.0f; wowState = DSPEngine::AntiDenormal(__builtin_fmaf(rawNoise - wowState, 0.0005f * srScale, wowState)); float wowMod = 1.0f + (wowState * 0.0015f); spd4 *= wowMod; spd5 *= wowMod;
-                        float w4=DSPEngine::processPitchTap(tap_w4_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT)+DSPEngine::processPitchTap(tap_w4_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT);
-                        float w5=DSPEngine::processPitchTap(tap_w5_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT)+DSPEngine::processPitchTap(tap_w5_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT);
+                        float w4=DSPEngine::processHermiteTap(tap_w4_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT)+DSPEngine::processHermiteTap(tap_w4_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT);
+                        float w5=DSPEngine::processHermiteTap(tap_w5_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT)+DSPEngine::processHermiteTap(tap_w5_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT);
                         if(feedbackActive) localFbRamp=(envBuf[i]>0.005f)?__builtin_fminf(1.0f,__builtin_fmaf(0.000011f, srScale, localFbRamp)):__builtin_fmaxf(0.0f,__builtin_fmaf(-0.0005f, srScale, localFbRamp)); else localFbRamp=__builtin_fmaxf(0.0f,__builtin_fmaf(-0.0001f, srScale, localFbRamp));
                         float mixV=__builtin_fmaxf(0.0f,__builtin_fminf((localFbRamp-0.1f)*2.0f,1.0f)), feedInput=(frzActive&&localFrzRamp>0.0f)?fzOutBuf[i]:__builtin_fmaf(w4, (1.0f-mixV), __builtin_fmaf(w5, mixV, fbOutNode*0.95f)); 
                         localFbHpf=DSPEngine::AntiDenormal(__builtin_fmaf(fbHpfCoeff, (feedInput-localFbHpf), DC_OFFSET)); 
@@ -415,11 +414,11 @@ void IRAM_ATTR __attribute__((optimize("Ofast"))) AudioDSPTask(void * pvParamete
                         int fbReadIdx=(fbDelayWriteIdx-delaySamples+FB_BUFFER_SIZE)&FB_BUFFER_MASK; fbOutNode=DSPEngine::AntiDenormal((float)fbDelayBuffer[fbReadIdx]*3.0517578125e-5f); fbDelayWriteIdx=(fbDelayWriteIdx+1)&FB_BUFFER_MASK;
                     } else { fbDelayBuffer[fbDelayWriteIdx]=0; fbOutNode=0.0f; fbDelayWriteIdx=(fbDelayWriteIdx+1)&FB_BUFFER_MASK; }
                     
-                    float rawW1 = DSPEngine::processPitchTap(tap_w1_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT)+DSPEngine::processPitchTap(tap_w1_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT); 
+                    float rawW1 = DSPEngine::processSincTap(tap_w1_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT)+DSPEngine::processSincTap(tap_w1_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT); 
                     float dampCutoff = (currentPitch > 1.498f) ? __builtin_fmaxf(0.1f, 1.0f - (currentPitch - 1.498f) * 0.5f) : 1.0f;
                     dampState = DSPEngine::AntiDenormal(__builtin_fmaf(dampCutoff, (rawW1 - dampState), dampState)); w1Buf[i] = dampState;
-                    w2Buf[i]=0.0f; if(__builtin_expect(harmActive, 0)) w2Buf[i]=DSPEngine::processPitchTap(tap_w2_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT)+DSPEngine::processPitchTap(tap_w2_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT); 
-                    w3Buf[i]=0.0f; if(__builtin_expect(chorusActive, 0)) w3Buf[i]=DSPEngine::processPitchTap(tap_w3_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT)+DSPEngine::processPitchTap(tap_w3_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT,pitchSincLUT);
+                    w2Buf[i]=0.0f; if(__builtin_expect(harmActive, 0)) w2Buf[i]=DSPEngine::processHermiteTap(tap_w2_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT)+DSPEngine::processHermiteTap(tap_w2_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT); 
+                    w3Buf[i]=0.0f; if(__builtin_expect(chorusActive, 0)) w3Buf[i]=DSPEngine::processHermiteTap(tap_w3_1,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT)+DSPEngine::processHermiteTap(tap_w3_2,sramPitchBuffer,sramWriteIdx,windowMask,hannIntMult,hannLUT);
                     
                     int32_t step1=(int32_t)((1.0f-spd1)*65536.0f); tap_w1_1+=step1; tap_w1_2+=step1; int32_t step2=(int32_t)((1.0f-spd2)*65536.0f); tap_w2_1+=step2; tap_w2_2+=step2; int32_t step3=(int32_t)((1.0f-spd3)*65536.0f); tap_w3_1+=step3; tap_w3_2+=step3; int32_t step4=(int32_t)((1.0f-spd4)*65536.0f); tap_w4_1+=step4; tap_w4_2+=step4; int32_t step5=(int32_t)((1.0f-spd5)*65536.0f); tap_w5_1+=step5; tap_w5_2+=step5;
                     
@@ -574,13 +573,10 @@ void setup() {
     hannLUT = (float*)heap_caps_aligned_alloc(64, HANN_LUT_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     lfoLUT = (float*)heap_caps_aligned_alloc(64, LFO_LUT_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     synthLUT = (float*)heap_caps_aligned_alloc(64, WAVE_LUT_SIZE * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    
-    // --- NEW: Allocate 16KB Pitch Sinc Interpolation LUT in Internal SRAM ---
-    pitchSincLUT = (float*)heap_caps_aligned_alloc(64, 4096 * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     apf1Buffer = (float*)heap_caps_aligned_alloc(64, 1009 * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     apf2Buffer = (float*)heap_caps_aligned_alloc(64, 863 * sizeof(float), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     
-    if (!hannLUT || !lfoLUT || !synthLUT || !apf1Buffer || !apf2Buffer || !pitchSincLUT) { Serial.println("FATAL ERROR: LUT Alloc"); while(1) { vTaskDelay(100); } }
+    if (!hannLUT || !lfoLUT || !synthLUT || !apf1Buffer || !apf2Buffer) { Serial.println("FATAL ERROR: LUT Alloc"); while(1) { vTaskDelay(100); } }
 
     memset(apf1Buffer, 0, 1009 * sizeof(float));
     memset(apf2Buffer, 0, 863 * sizeof(float));
@@ -588,19 +584,6 @@ void setup() {
     for(int i=0; i<4096; i++) { hannLUT[i]=0.5f*(1.0f-cosf(TWO_PI*((float)i/4095.0f))); } 
     for(int i=0; i<1024; i++) { lfoLUT[i]=powf(2.0f,(15.0f*sinf(TWO_PI*((float)i/1024.0f)))/1200.0f); } 
     for(int i=0; i<2048; i++) { synthLUT[i]=sinf((((float)i-1024.0f)/1024.0f)*45.0f); }
-
-    // --- NEW: Mathematically Generate the High-Fidelity Sinc Array ---
-    for(int i=0; i<1024; i++) {
-        float frac = (float)i / 1023.0f;
-        float x[4] = { 1.0f + frac, frac, 1.0f - frac, 2.0f - frac };
-        for(int j=0; j<4; j++) {
-            float val = 0.0f;
-            if (fabsf(x[j]) < 1e-5f) val = 1.0f;
-            else val = sinf(M_PI * x[j]) / (M_PI * x[j]);
-            val *= 0.5f * (1.0f + cosf(M_PI * x[j] / 2.0f)); // Hann Window boundary 
-            pitchSincLUT[i*4 + j] = val;
-        }
-    }
 
     delayBuffer=(int16_t*)heap_caps_aligned_alloc(64, MAX_BUFFER_SIZE*sizeof(int16_t), MALLOC_CAP_SPIRAM);
     sramPitchBuffer=(int16_t*)heap_caps_aligned_alloc(64, SRAM_PITCH_BUF_SIZE*sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -772,6 +755,7 @@ void loop() {
     tData.peakLoopLatency = max_loop_latency_ms.exchange(0, std::memory_order_relaxed);
 
     static unsigned long lastTelemetryPrint = 0;
+    // --- TELEMETRY BUG FIX (Prevents aliasing across 5s toggle states) ---
     if (millis() - lastTelemetryPrint >= 7000) {
         lastTelemetryPrint = millis();
         serialMonitor.printMetrics(tData);
