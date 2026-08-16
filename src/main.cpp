@@ -222,25 +222,97 @@ void toggleSampleRate() {
 }
 
 bool channelMessageCallback(ChannelMessage cm) {
-    lastActivityTime=millis();
-    if(cm.header==0xB0) {
-        if(cm.data1==4 && cm.data2>=64) { triggerPanicReset(); return false; }
-        if(cm.data1==11) { 
-            uint16_t mappedCC=map(cm.data2,0,127,0,16383); currentCC11=mappedCC; currentPB3=mappedCC; lastActivePedal=mappedCC; 
-            if(isVolumeMode) { volumePedalGain=(float)mappedCC/16383.0f; dspNeedsCommit = true; Control_Surface.sendControlChange({19,Channel_1},cm.data2); } else { if(!lutNeedsUpdate) { float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); if(currentLUT) pitchShiftFactor.store(currentLUT[mappedCC], std::memory_order_release); } } return false; 
+    lastActivityTime = millis();
+    if (cm.header != 0xB0) return false;
+
+    // 1. Pass the raw CC to the decoupled router
+    MidiAction action = MidiRouter::parseMessage(cm.data1, cm.data2);
+    if (action.event == MidiEvent::NONE) return false;
+
+    int currentMode = activeEffectMode.load(std::memory_order_acquire);
+
+    // 2. Execute the returned event
+    switch (action.event) {
+        case MidiEvent::EXPRESSION_UPDATE:
+            currentCC11 = action.rawValue; currentPB3 = action.rawValue; lastActivePedal = action.rawValue;
+            if (isVolumeMode) { 
+                volumePedalGain = (float)action.rawValue / 16383.0f; dspNeedsCommit = true; 
+                Control_Surface.sendControlChange({19, Channel_1}, action.val); 
+            } else { 
+                if (!lutNeedsUpdate) { 
+                    float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire); 
+                    if (currentLUT) pitchShiftFactor.store(currentLUT[action.rawValue], std::memory_order_release); 
+                } 
+            }
+            break;
+            
+        case MidiEvent::KNOB_UPDATE:
+            MidiRouter::updateParameter(action.cc, action.val, currentMode, effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx);
+            settingsNeedSaving = true; lastParameterChangeTime = millis();
+            break;
+
+        case MidiEvent::PREV_MODE: switchEffectMode(currentMode - 1); break;
+        case MidiEvent::NEXT_MODE: switchEffectMode(currentMode + 1); break;
+        case MidiEvent::LATENCY_CYCLE: cycleLatencyMode(); break;
+        case MidiEvent::PANIC_RESET: triggerPanicReset(); break;
+        case MidiEvent::SR_TOGGLE: sampleRateToggleRequested = true; break;
+        
+        case MidiEvent::PB2_WIPER_TOGGLE: 
+            isPB2WiperMode = !isPB2WiperMode; dspNeedsCommit = true; pb2ToggleRequested = true; 
+            break;
+
+        case MidiEvent::VOL_MODE_TOGGLE:
+            isVolumeMode = !isVolumeMode; 
+            if (!isVolumeMode) { 
+                volumePedalGain = 1.0f; pedals.lockPB3Whammy(); currentPB3 = 8192; lastActivePedal = 8192; 
+                Control_Surface.sendPitchBend(Channel_3, 8192);
+            } else { 
+                pedals.lockPB3Volume(); lastActivePedal = 8192; volumePedalGain = (float)currentPB3 / 16383.0f; 
+            } 
+            if (!lutNeedsUpdate) {
+                float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
+                if (currentLUT) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release); 
+            }
+            dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis(); 
+            break;
+
+        case MidiEvent::TOGGLE_EFFECT:
+            if (action.targetEffect == 1) isFrozen = !isFrozen;
+            else if (action.targetEffect == 2) isFeedbackActive = !isFeedbackActive;
+            else if (action.targetEffect == 3) isHarmonizerMode = !isHarmonizerMode;
+            else if (action.targetEffect == 4) isCapoMode = !isCapoMode;
+            else if (action.targetEffect == 5) isSynthMode = !isSynthMode;
+            else if (action.targetEffect == 6) isPadMode = !isPadMode;
+            else if (action.targetEffect == 7) isChorusMode = !isChorusMode;
+            else if (action.targetEffect == 8) isSwellMode = !isSwellMode;
+            else if (action.targetEffect == 9) isVibratoMode = !isVibratoMode;
+            
+            // If we toggle the effect that corresponds to the base mode, flip the Whammy flag too
+            if (currentMode == action.targetEffect) {
+                isWhammyActive = !isWhammyActive;
+                if (currentMode == 4 && isCapoMode) lutNeedsUpdate = true; // Specific update for Capo
+            }
+            
+            dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
+            break;
+
+        case MidiEvent::STEP_PARAM_UP:
+        case MidiEvent::STEP_PARAM_DOWN: {
+            float step = (action.event == MidiEvent::STEP_PARAM_DOWN) ? -1.0f : 1.0f;
+            if (currentMode == 0 || currentMode == 1 || currentMode == 8) effectMemory[1] = constrain(effectMemory[1] + step, -24.0f, 24.0f); 
+            else if (currentMode == 4) effectMemory[4] = constrain(effectMemory[4] + step, -24.0f, 24.0f); 
+            else if (currentMode == 2) { 
+                int fbIdx = feedbackIntervalIdx.load(std::memory_order_acquire);
+                feedbackIntervalIdx.store(step > 0 ? (fbIdx + 1) % 5 : (fbIdx + 4) % 5, std::memory_order_release);
+            } else { 
+                effectMemory[currentMode] = constrain(effectMemory[currentMode] + step, -24.0f, 24.0f); 
+            }
+            lutNeedsUpdate = true; dspNeedsCommit = true; settingsNeedSaving = true; lastParameterChangeTime = millis();
+            break;
         }
-        if(cm.data1>=24 && cm.data1<=28) { MidiRouter::updateParameter(cm.data1, cm.data2, activeEffectMode.load(std::memory_order_acquire), effectMemory, fxParams, lutNeedsUpdate, dspNeedsCommit, feedbackIntervalIdx); return false; }
-        if(cm.data1==5 && cm.data2>=64) { isPB2WiperMode=!isPB2WiperMode; dspNeedsCommit = true; pb2ToggleRequested=true; }
-        else if(cm.data1==6 && cm.data2>=64) { 
-            bool sendCenterMidi=false; isVolumeMode=!isVolumeMode; float* currentLUT = LUTManager::pitchShiftLUT.load(std::memory_order_acquire);
-            if(!isVolumeMode) { volumePedalGain=1.0f; pedals.lockPB3Whammy(); sendCenterMidi=true; currentPB3=8192; lastActivePedal=8192; if(!lutNeedsUpdate && currentLUT!=nullptr) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release); } else { pedals.lockPB3Volume(); lastActivePedal=8192; volumePedalGain=(float)currentPB3 / 16383.0f; if(!lutNeedsUpdate && currentLUT!=nullptr) pitchShiftFactor.store(currentLUT[8192], std::memory_order_release); } 
-            dspNeedsCommit = true; if(sendCenterMidi) Control_Surface.sendPitchBend(Channel_3, 8192); settingsNeedSaving=true; lastParameterChangeTime=millis(); 
-        }
-        if(cm.data1==7 && cm.data2>=64) { 
-            if(isWhammyActive) { isWhammyActive=false; isFrozen=false; isFeedbackActive=false; isHarmonizerMode=false; isCapoMode=false; isSynthMode=false; isPadMode=false; isChorusMode=false; isSwellMode=false; isVibratoMode=false; }
-            else { switchEffectMode(activeEffectMode.load(std::memory_order_acquire)); }
-            dspNeedsCommit = true; settingsNeedSaving=true; lastParameterChangeTime=millis();
-        }
+        
+        case MidiEvent::NONE:
+            break;
     }
     return false;
 }
