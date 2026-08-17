@@ -1,147 +1,110 @@
-#pragma once
+#ifndef MIDI_ROUTER_H
+#define MIDI_ROUTER_H
+
 #include <Arduino.h>
 #include <atomic>
+#include "freertos/FreeRTOS.h"
+#include "SpinlockGuard.h"
 
-// 1. Define the possible actions the MIDI controller can trigger
-enum class MidiEvent {
-    NONE,
-    PREV_MODE, NEXT_MODE, LATENCY_CYCLE, PANIC_RESET, SR_TOGGLE,
-    PB2_WIPER_TOGGLE, VOL_MODE_TOGGLE, TOGGLE_EFFECT,
-    STEP_PARAM_UP, STEP_PARAM_DOWN, EXPRESSION_UPDATE, KNOB_UPDATE
+enum class MidiEvent : uint8_t {
+    NONE = 0,
+    EXPRESSION_UPDATE,
+    KNOB_UPDATE,
+    PREV_MODE,
+    NEXT_MODE,
+    LATENCY_CYCLE,
+    PANIC_RESET,
+    SR_TOGGLE,
+    PB2_WIPER_TOGGLE,
+    VOL_MODE_TOGGLE,
+    TOGGLE_EFFECT,
+    STEP_PARAM_UP,
+    STEP_PARAM_DOWN
 };
 
-// 2. Define the payload passed back to main.cpp
 struct MidiAction {
     MidiEvent event = MidiEvent::NONE;
-    int targetEffect = -1;  // Used for effect toggles
-    uint16_t rawValue = 0;  // Used for 14-bit expression mapping
     uint8_t cc = 0;
     uint8_t val = 0;
+    uint16_t rawValue = 0;
+    int targetEffect = 0;
 };
 
 class MidiRouter {
 public:
-    // 3. The Decoupled Translator
-    static MidiAction parseMessage(uint8_t cc, uint8_t val) {
+    // Corrected case: portMUX_INITIALIZER_UNLOCKED
+    inline static portMUX_TYPE paramMux = portMUX_INITIALIZER_UNLOCKED;
+
+    static inline MidiAction parseMessage(uint8_t data1, uint8_t data2) {
         MidiAction action;
-        action.cc = cc;
-        action.val = val;
+        action.cc = data1;
+        action.val = data2;
 
-        // Route Expression Pedal
-        if (cc == 11) {
-            action.event = MidiEvent::EXPRESSION_UPDATE;
-            action.rawValue = map(val, 0, 127, 0, 16383);
-            return action;
-        }
-        
-        // Route Dynamic Parameter Knobs
-        if (cc >= 24 && cc <= 28) {
-            action.event = MidiEvent::KNOB_UPDATE;
-            return action;
+        switch (data1) {
+            case 11: // Expression Pedal / Pitch Bend proxy
+                action.event = MidiEvent::EXPRESSION_UPDATE;
+                action.rawValue = (uint16_t)data2 * 128; // Map 7-bit to 14-bit equivalent
+                break;
+
+            case 14: action.event = MidiEvent::PREV_MODE; break;
+            case 15: action.event = MidiEvent::NEXT_MODE; break;
+            case 16: action.event = MidiEvent::LATENCY_CYCLE; break;
+            case 17: action.event = MidiEvent::PANIC_RESET; break;
+            case 18: action.event = MidiEvent::SR_TOGGLE; break;
+            case 19: action.event = MidiEvent::VOL_MODE_TOGGLE; break;
+            case 20: action.event = MidiEvent::PB2_WIPER_TOGGLE; break;
+
+            case 21: action.event = MidiEvent::STEP_PARAM_DOWN; break;
+            case 22: action.event = MidiEvent::STEP_PARAM_UP; break;
+
+            // Direct Effect Toggles (CC 30-39 map to Effects 0-9)
+            case 30: case 31: case 32: case 33: case 34:
+            case 35: case 36: case 37: case 38: case 39:
+                action.event = MidiEvent::TOGGLE_EFFECT;
+                action.targetEffect = data1 - 30;
+                break;
+
+            // Real-time Knob Parameter Updates (CC 70-74 map to parameters 0-4)
+            case 70: case 71: case 72: case 73: case 74:
+                action.event = MidiEvent::KNOB_UPDATE;
+                break;
+
+            default:
+                action.event = MidiEvent::NONE;
+                break;
         }
 
-        // Ignore button releases (values < 64) for toggle switches
-        if (val < 64) return action;
-
-        // Route System Commands & Toggles
-        switch (cc) {
-            case 0:  action.event = MidiEvent::PREV_MODE; break;
-            case 1:  action.event = MidiEvent::NEXT_MODE; break;
-            case 2:  action.event = MidiEvent::LATENCY_CYCLE; break;
-            case 3:  action.event = MidiEvent::PANIC_RESET; break;
-            case 4:  action.event = MidiEvent::SR_TOGGLE; break;
-            case 5:  action.event = MidiEvent::PB2_WIPER_TOGGLE; break;
-            case 6:  action.event = MidiEvent::VOL_MODE_TOGGLE; break;
-            case 7:  action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 9; break; // Vibrato
-            case 8:  action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 1; break; // Freeze
-            case 9:  action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 2; break; // Feedback
-            case 10: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 3; break; // Harmony
-            case 12: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 4; break; // Capo
-            case 13: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 5; break; // Synth
-            case 14: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 6; break; // Pad
-            case 15: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 7; break; // Chorus
-            case 16: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 8; break; // Swell
-            case 17: action.event = MidiEvent::STEP_PARAM_DOWN; break;
-            case 18: action.event = MidiEvent::STEP_PARAM_UP; break;
-        }
         return action;
     }
 
-    // 4. The Parameter Engine
-    static void updateParameter(uint8_t cc, uint8_t val, int currentMode, volatile float* effectMemory, volatile float fxParams[10][5], volatile bool& lutNeedsUpdate, volatile bool& dspNeedsCommit, std::atomic<int>& feedbackIntervalIdx) {
-        float norm = (float)val / 127.0f; 
-        int pIdx = cc - 24; 
-        
-        if (currentMode == 0) { 
-            if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 2) fxParams[0][0] = norm; 
-            if (pIdx == 3) fxParams[0][1] = norm; 
-        } 
-        else if (currentMode == 1) { 
-            if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 2) fxParams[1][0] = 0.0f + (norm * 0.95f);               
-            if (pIdx == 3) fxParams[1][1] = 0.00001f + (norm * 0.001f);          
-            if (pIdx == 4) fxParams[1][2] = 0.00001f + (norm * 0.0005f);         
-        }
-        else if (currentMode == 2) { 
-            if (pIdx == 0) { 
-                int newIdx = constrain((int)roundf(norm * 4.0f), 0, 4);
-                if (newIdx != feedbackIntervalIdx.load(std::memory_order_acquire)) {
-                    feedbackIntervalIdx.store(newIdx, std::memory_order_release);
-                    lutNeedsUpdate = true;
-                }
-            }
-            if (pIdx == 1) fxParams[2][0] = 1000.0f + (norm * 10000.0f);         
-            if (pIdx == 2) fxParams[2][1] = 1.0f + (norm * 100.0f);             
-            if (pIdx == 3) fxParams[2][2] = 0.005f + (norm * 0.045f);            
-        }
-        else if (currentMode == 3) { 
-            if (pIdx == 0) { effectMemory[3] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 1) fxParams[3][0] = norm;                                
-        }
-        else if (currentMode == 4) { 
-            if (pIdx == 0) { 
-                int cents = (int)roundf((effectMemory[4] - (float)roundf(effectMemory[4])) * 100.0f); 
-                effectMemory[4] = constrain(roundf((norm * 48.0f) - 24.0f) + ((float)cents / 100.0f), -24.0f, 24.0f);
-                lutNeedsUpdate = true; 
-            }
-            if (pIdx == 1) { 
-                int semi = (int)roundf(effectMemory[4]); 
-                float c = roundf((norm * 100.0f) - 50.0f) / 100.0f; 
-                effectMemory[4] = constrain((float)semi + c, -24.0f, 24.0f);
-                lutNeedsUpdate = true; 
+    static inline void updateParameter(
+        uint8_t cc, 
+        uint8_t val, 
+        int currentMode, 
+        volatile float* effectMemory, 
+        float fxParams[10][5], 
+        volatile bool& lutNeedsUpdate, 
+        volatile bool& dspNeedsCommit, 
+        std::atomic<int>& feedbackIntervalIdx) 
+    {
+        int paramIdx = cc - 70;
+        if (paramIdx < 0 || paramIdx >= 5) return;
+
+        float normalizedVal = (float)val / 127.0f;
+
+        {
+            CriticalSectionGuard lock(paramMux);
+            fxParams[currentMode][paramIdx] = normalizedVal;
+
+            if (currentMode == 2 && paramIdx == 0) { // Feedback Interval Mode
+                int fbIdx = (int)(normalizedVal * 4.99f);
+                feedbackIntervalIdx.store(fbIdx, std::memory_order_release);
             }
         }
-        else if (currentMode == 5) { 
-            if (pIdx == 0) { effectMemory[5] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 1) fxParams[5][0] = 0.01f + (norm * 0.5f);               
-            if (pIdx == 2) fxParams[5][1] = 0.001f + (norm * 0.05f);             
-            if (pIdx == 3) fxParams[5][2] = 0.1f + (norm * 0.8f);               
-            if (pIdx == 4) fxParams[5][3] = norm;                                
-        }
-        else if (currentMode == 6) { 
-            if (pIdx == 0) { effectMemory[6] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 1) fxParams[6][0] = 0.8f + (norm * 0.199f);              
-            if (pIdx == 2) fxParams[6][1] = norm * 3.0f;                         
-        }
-        else if (currentMode == 7) { 
-            if (pIdx == 0) { effectMemory[7] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 1) fxParams[7][0] = 500.0f + (norm * 4500.0f);           
-            if (pIdx == 2) fxParams[7][1] = norm;                                
-        }
-        else if (currentMode == 8) { 
-            if (pIdx == 0) { effectMemory[1] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 1) { effectMemory[0] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 2) fxParams[8][0] = 0.001f + (norm * 0.05f);             
-            if (pIdx == 3) fxParams[8][1] = 0.00001f + (norm * 0.0005f);        
-            if (pIdx == 4) fxParams[8][2] = 0.00001f + (norm * 0.0005f);        
-        }
-        else if (currentMode == 9) { 
-            if (pIdx == 0) { effectMemory[9] = roundf((norm * 48.0f) - 24.0f); lutNeedsUpdate = true; } 
-            if (pIdx == 1) fxParams[9][0] = norm * 2.0f;                         
-        }
+
+        lutNeedsUpdate = true;
         dspNeedsCommit = true;
     }
 };
+
+#endif // MIDI_ROUTER_H

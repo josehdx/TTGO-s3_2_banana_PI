@@ -1,4 +1,4 @@
-// BananaHardware_v1.15
+// BananaHardware.h
 #ifndef BANANA_HARDWARE_H
 #define BANANA_HARDWARE_H
 
@@ -9,19 +9,18 @@
 
 class BananaHardware {
 public:
-    // Centralized I2S Pin Config for Banana Leaf
     static i2s_std_config_t getI2SConfig(uint32_t sampleRate) {
         i2s_std_config_t stdConfig = { 
-            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate), 
-            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
-            .gpio_cfg = { 
-                .mclk = GPIO_NUM_6, 
-                .bclk = GPIO_NUM_7, 
-                .ws   = GPIO_NUM_18, 
-                .dout = GPIO_NUM_21, 
-                .din  = GPIO_NUM_17 
-            } 
-        };
+             .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate),
+             .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+             .gpio_cfg = {
+                 .mclk = GPIO_NUM_6,
+                 .bclk = GPIO_NUM_7,
+                 .ws   = GPIO_NUM_18,
+                 .dout = GPIO_NUM_21,
+                 .din  = GPIO_NUM_17
+             } 
+         };
         stdConfig.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
         return stdConfig;
     }
@@ -47,15 +46,16 @@ public:
                     if(p->type2.channel == ADC_CHANNEL_9) pb3 = p->type2.data;
                     if(p->type2.channel == ADC_CHANNEL_3) bat.store(p->type2.data, std::memory_order_relaxed);
                 }
-            } else if (err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_STATE) { 
-                adc_continuous_stop(handle); 
-                vTaskDelay(pdMS_TO_TICKS(2)); 
-                adc_continuous_start(handle); 
-                break; 
-            } else { 
-                adc_continuous_stop(handle); 
-                adc_continuous_start(handle); 
-                break; 
+            } else if (err == ESP_ERR_TIMEOUT) {
+                // Non-blocking timeout indicates no buffer frame is ready; exit cleanly without thrashing ADC driver
+                break;
+            } else if (err == ESP_ERR_INVALID_STATE) {
+                adc_continuous_stop(handle);
+                vTaskDelay(pdMS_TO_TICKS(2));
+                adc_continuous_start(handle);
+                break;
+            } else {
+                break;
             }
         }
     }
