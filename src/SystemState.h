@@ -4,6 +4,13 @@
 #define ENABLE_ADVANCED_TELEMETRY 
 
 #include <Arduino.h>
+
+#if defined(TARGET_BANANA)
+    #define ENABLE_STRESS_TESTER true
+#else
+    #define ENABLE_STRESS_TESTER false 
+#endif
+
 #include <atomic>
 #include "freertos/FreeRTOS.h"
 #include "driver/i2s_std.h"

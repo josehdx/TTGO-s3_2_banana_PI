@@ -38,7 +38,7 @@ public:
 
             // Automated Bounds-Checking: Reboot on Latency Spike
             uint32_t currentLatency = max_loop_latency_ms.load(std::memory_order_relaxed);
-            if (currentLatency > 50) {
+            if (currentLatency > 250) { // Increased from 50 to allow USB flash writes
                 Serial0.printf("\n[FATAL ERROR] Loop Latency spiked to %lu ms! Initiating Auto-Reboot...\n", currentLatency);
                 vTaskDelay(pdMS_TO_TICKS(100));
                 ESP.restart();
@@ -102,7 +102,7 @@ public:
 
             // Automated Bounds-Checking: Reboot on Latency Spike
             uint32_t currentLatency = max_loop_latency_ms.load(std::memory_order_relaxed);
-            if (currentLatency > 50) {
+            if (currentLatency > 250) { // Increased from 50 to allow USB flash writes
                 Serial0.printf("\n[FATAL ERROR] Loop Latency spiked to %lu ms! Initiating Auto-Reboot...\n", currentLatency);
                 vTaskDelay(pdMS_TO_TICKS(100));
                 ESP.restart();
@@ -180,4 +180,5 @@ public:
         }
     }
 };
+
 #endif
