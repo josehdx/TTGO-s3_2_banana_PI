@@ -32,7 +32,6 @@ struct MidiAction {
 
 class MidiRouter {
 public:
-    // Corrected case: portMUX_INITIALIZER_UNLOCKED
     inline static portMUX_TYPE paramMux = portMUX_INITIALIZER_UNLOCKED;
 
     static inline MidiAction parseMessage(uint8_t data1, uint8_t data2) {
@@ -41,31 +40,38 @@ public:
         action.val = data2;
 
         switch (data1) {
+            // --- SYSTEM & GLOBAL CONTROLS ---
+            case 0: action.event = MidiEvent::PREV_MODE; break;       // Cycles backward
+            case 1: action.event = MidiEvent::NEXT_MODE; break;       // Cycles forward
+            case 2: action.event = MidiEvent::SR_TOGGLE; break;       // Sample rate toggle
+            case 3: action.event = MidiEvent::LATENCY_CYCLE; break;   // Latency toggle
+            case 4: action.event = MidiEvent::PANIC_RESET; break;     // Panic reset
+            case 5: action.event = MidiEvent::TOGGLE_EFFECT; 
+                    action.targetEffect = 99; // 99 acts as our special MonoPoly ID
+                    break;
+            case 6: action.event = MidiEvent::VOL_MODE_TOGGLE; break; // Vol toggle
+            
             case 11: // Expression Pedal / Pitch Bend proxy
                 action.event = MidiEvent::EXPRESSION_UPDATE;
-                action.rawValue = (uint16_t)data2 * 128; // Map 7-bit to 14-bit equivalent
+                action.rawValue = (uint16_t)data2 * 128; 
                 break;
+                
+            case 17: action.event = MidiEvent::STEP_PARAM_DOWN; break; // Preserved for param steps
+            case 18: action.event = MidiEvent::STEP_PARAM_UP; break;   // Preserved for param steps
 
-            case 14: action.event = MidiEvent::PREV_MODE; break;
-            case 15: action.event = MidiEvent::NEXT_MODE; break;
-            case 16: action.event = MidiEvent::LATENCY_CYCLE; break;
-            case 17: action.event = MidiEvent::PANIC_RESET; break;
-            case 18: action.event = MidiEvent::SR_TOGGLE; break;
-            case 19: action.event = MidiEvent::VOL_MODE_TOGGLE; break;
-            case 20: action.event = MidiEvent::PB2_WIPER_TOGGLE; break;
+            // --- DIRECT EFFECT TOGGLES ---
+            case 7:  action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 9; break; // Vibrato
+            case 8:  action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 1; break; // Freeze
+            case 9:  action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 2; break; // Feedback
+            case 10: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 3; break; // Harmonizer
+            case 12: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 4; break; // Capo
+            case 13: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 5; break; // Synth
+            case 14: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 6; break; // Pad
+            case 15: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 7; break; // Chorus
+            case 16: action.event = MidiEvent::TOGGLE_EFFECT; action.targetEffect = 8; break; // Swell
 
-            case 21: action.event = MidiEvent::STEP_PARAM_DOWN; break;
-            case 22: action.event = MidiEvent::STEP_PARAM_UP; break;
-
-            // Direct Effect Toggles (CC 30-39 map to Effects 0-9)
-            case 30: case 31: case 32: case 33: case 34:
-            case 35: case 36: case 37: case 38: case 39:
-                action.event = MidiEvent::TOGGLE_EFFECT;
-                action.targetEffect = data1 - 30;
-                break;
-
-            // Real-time Knob Parameter Updates (CC 70-74 map to parameters 0-4)
-            case 70: case 71: case 72: case 73: case 74:
+            // --- HARDWARE KNOB PARAMETERS ---
+            case 24: case 25: case 26: case 27: case 28:
                 action.event = MidiEvent::KNOB_UPDATE;
                 break;
 
@@ -73,7 +79,6 @@ public:
                 action.event = MidiEvent::NONE;
                 break;
         }
-
         return action;
     }
 
@@ -87,21 +92,20 @@ public:
         volatile bool& dspNeedsCommit, 
         std::atomic<int>& feedbackIntervalIdx) 
     {
-        int paramIdx = cc - 70;
+        // Calculate the parameter index (0-4) using the new base CC 24
+        int paramIdx = cc - 24; 
         if (paramIdx < 0 || paramIdx >= 5) return;
-
+        
         float normalizedVal = (float)val / 127.0f;
-
         {
             CriticalSectionGuard lock(paramMux);
             fxParams[currentMode][paramIdx] = normalizedVal;
-
+            
             if (currentMode == 2 && paramIdx == 0) { // Feedback Interval Mode
                 int fbIdx = (int)(normalizedVal * 4.99f);
                 feedbackIntervalIdx.store(fbIdx, std::memory_order_release);
             }
         }
-
         lutNeedsUpdate = true;
         dspNeedsCommit = true;
     }
